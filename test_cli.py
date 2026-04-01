@@ -247,6 +247,37 @@ class TestCreateEvents:
         assert result.exit_code == 0
         assert "Nothing to create" in result.output
 
+    def test_resbaz_suffix_appended_to_title(self):
+        """create-events must send '<title> [Resbaz]' to the Eventbrite API."""
+        runner = CliRunner()
+        df = _make_df_with_times()
+        # Only the first row lacks a registration link → needs creating
+        df.loc[1, "registration_link"] = "https://www.eventbrite.com/e/existing-99999"
+        mock_ws = MagicMock()
+
+        copy_resp = MagicMock()
+        copy_resp.status_code = 200
+        copy_resp.json.return_value = {"id": "11111"}
+
+        update_resp = MagicMock()
+        update_resp.status_code = 200
+        update_resp.json.return_value = {"id": "11111", "url": "https://www.eventbrite.com/e/new-11111"}
+
+        desc_resp = MagicMock()
+        desc_resp.status_code = 200
+
+        post_responses = [copy_resp, update_resp, desc_resp]
+
+        with patch("cli._load_sheet_data", return_value=(df, mock_ws)):
+            with patch("cli._load_schedule_from_github", side_effect=Exception("network")):
+                with patch("cli.requests.post", side_effect=post_responses) as mock_post:
+                    result = runner.invoke(cli, ["create-events"], env=ENV, input="y\n")
+
+        assert result.exit_code == 0, result.output
+        # Second POST is the update call — verify [Resbaz] suffix
+        update_call_kwargs = mock_post.call_args_list[1].kwargs
+        assert update_call_kwargs["json"]["event.name.html"].endswith(" [Resbaz]")
+
 
 class TestDeleteDrafts:
     def test_dry_run_no_delete(self):
@@ -527,7 +558,7 @@ class TestCheck:
         mock_ws = MagicMock()
 
         eb_events = {
-            "99999": {"name": {"text": "Data Science Workshop"}, "status": "live"}
+            "99999": {"name": {"text": "Data Science Workshop [Resbaz]"}, "status": "live"}
         }
 
         def _fake_get(url, **kwargs):

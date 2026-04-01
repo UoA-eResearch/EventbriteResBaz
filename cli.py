@@ -372,7 +372,7 @@ def create_events(dry_run, content_version):
             headers=headers,
             timeout=30,
             json={
-                "event.name.html": row.title,
+                "event.name.html": f"{row.title} [Resbaz]",
                 "event.description.html": description,
                 "event.start.utc": row.start_time_UTC.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "event.start.timezone": "Pacific/Auckland",
@@ -537,7 +537,7 @@ def update_events(dry_run, content_version, skip_descriptions):
             headers=headers,
             timeout=30,
             json={
-                "event.name.html": row.title,
+                "event.name.html": f"{row.title} [Resbaz]",
                 "event.description.html": row.description,
                 "event.start.utc": row.start_time_UTC.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "event.start.timezone": "Pacific/Auckland",
@@ -1354,8 +1354,11 @@ def check(show_diff):
         eb_status = event.get("status", "unknown")
         sheet_name = row.title
 
+        # Strip the [Resbaz] suffix added on create/update before comparing
+        eb_name_normalised = eb_name.removesuffix(" [Resbaz]")
+
         diffs = []
-        if eb_name.lower().strip() != sheet_name.lower().strip():
+        if eb_name_normalised.lower().strip() != sheet_name.lower().strip():
             diffs.append(("title", sheet_name, eb_name))
 
         if diffs:
