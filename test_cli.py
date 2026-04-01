@@ -248,7 +248,7 @@ class TestCreateEvents:
         assert "Nothing to create" in result.output
 
     def test_resbaz_suffix_appended_to_title(self):
-        """create-events must send '<title> [Resbaz]' to the Eventbrite API."""
+        """create-events must send '<title> [ResBaz]' to the Eventbrite API."""
         runner = CliRunner()
         df = _make_df_with_times()
         # Only the first row lacks a registration link → needs creating
@@ -266,17 +266,41 @@ class TestCreateEvents:
         desc_resp = MagicMock()
         desc_resp.status_code = 200
 
-        post_responses = [copy_resp, update_resp, desc_resp]
+        clear_resp = MagicMock()
+        clear_resp.status_code = 200
+
+        post_responses = [copy_resp, update_resp, desc_resp, clear_resp]
+
+        version_resp = MagicMock()
+        version_resp.status_code = 200
+        version_resp.json.return_value = {"page_version_number": 1}
 
         with patch("cli._load_sheet_data", return_value=(df, mock_ws)):
             with patch("cli._load_schedule_from_github", side_effect=Exception("network")):
                 with patch("cli.requests.post", side_effect=post_responses) as mock_post:
-                    result = runner.invoke(cli, ["create-events"], env=ENV, input="y\n")
+                    with patch("cli.requests.get", return_value=version_resp):
+                        result = runner.invoke(cli, ["create-events"], env=ENV, input="y\n")
 
         assert result.exit_code == 0, result.output
-        # Second POST is the update call — verify [Resbaz] suffix
+        # Second POST is the update call — verify [ResBaz] suffix
         update_call_kwargs = mock_post.call_args_list[1].kwargs
-        assert update_call_kwargs["json"]["event.name.html"].endswith(" [Resbaz]")
+        assert update_call_kwargs["json"]["event.name.html"].endswith(" [ResBaz]")
+
+    def test_confirmed_status_filter(self):
+        """create-events only creates events for sessions with status=='confirmed'."""
+        runner = CliRunner()
+        df = _make_df_with_times()
+        df["status"] = ["confirmed", "pending"]
+        df.loc[0, "registration_link"] = ""
+        df.loc[1, "registration_link"] = ""
+        mock_ws = MagicMock()
+        with patch("cli._load_sheet_data", return_value=(df, mock_ws)):
+            with patch("cli._load_schedule_from_github", side_effect=Exception("net")):
+                result = runner.invoke(cli, ["create-events", "--dry-run"], env=ENV)
+        assert result.exit_code == 0
+        # Only the confirmed row should appear
+        assert "Intro to Python" in result.output
+        assert "Data Science Workshop" not in result.output
 
 
 class TestDeleteDrafts:
@@ -558,7 +582,7 @@ class TestCheck:
         mock_ws = MagicMock()
 
         eb_events = {
-            "99999": {"name": {"text": "Data Science Workshop [Resbaz]"}, "status": "live"}
+            "99999": {"name": {"text": "Data Science Workshop [ResBaz]"}, "status": "live"}
         }
 
         def _fake_get(url, **kwargs):
@@ -592,3 +616,68 @@ class TestCheck:
                 result = runner.invoke(cli, ["check"], env=ENV)
         assert result.exit_code == 0
         assert "difference" in result.output.lower() or "⚠" in result.output
+
+
+class TestGenerateYaml:
+    def test_generates_files(self, tmp_path):
+        runner = CliRunner()
+        schedule_rows = [
+            {
+                "date": "2025-06-10",
+                "dateReadable": "Monday 10 June",
+                "startTime": "09:00",
+                "endTime": "10:00",
+                "track1": "1",
+                "track2": "",
+                "track3": "",
+            },
+        ]
+        sessions_rows = [
+            {
+                "id": "1",
+                "title": "Intro to Python",
+                "description": "Learn Python.",
+                "status": "confirmed",
+                "registration_link": "",
+                "capacity": "30",
+                "instructors": "",
+                "complexity": "beginner",
+                "themes": "Python",
+                "length": "1",
+            },
+        ]
+
+        schedule_df = pd.DataFrame(schedule_rows)
+        sessions_df = pd.DataFrame(sessions_rows)
+        speakers_df = pd.DataFrame(
+            columns=[
+                "id", "name", "surname", "company", "title", "bio",
+                "thumbnailUrl", "skip", "ribbon_abbr", "ribbon_title",
+                "ribbon_url", "social_name", "social_link",
+            ]
+        )
+
+        mock_spreadsheet = MagicMock()
+
+        def _fake_ws(name):
+            m = MagicMock()
+            if name == "sessions":
+                rows = [list(sessions_df.columns)] + sessions_df.values.tolist()
+            elif name == "schedule":
+                rows = [list(schedule_df.columns)] + schedule_df.values.tolist()
+            else:  # speakers
+                rows = [list(speakers_df.columns)]
+            m.get_all_values.return_value = rows
+            return m
+
+        mock_spreadsheet.worksheet.side_effect = _fake_ws
+
+        with patch("cli._open_spreadsheet", return_value=mock_spreadsheet):
+            result = runner.invoke(
+                cli, ["generate-yaml", "--output-dir", str(tmp_path)], env=ENV
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "schedule.yml").exists()
+        assert (tmp_path / "sessions.yml").exists()
+        assert (tmp_path / "speakers.yml").exists()

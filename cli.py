@@ -9,9 +9,13 @@ Configuration is loaded from a .env file (see .env.example).
 """
 
 import difflib
+import json
 import os
+import re
 from io import StringIO
 from pathlib import Path
+
+import yaml
 
 __version__ = "1.0.0"
 
@@ -51,8 +55,8 @@ def _get_headers() -> dict:
     }
 
 
-def _get_worksheet():
-    """Return an authenticated gspread Worksheet object."""
+def _open_spreadsheet():
+    """Return an authenticated gspread Spreadsheet object."""
     try:
         import gspread
         from google.oauth2.service_account import Credentials
@@ -74,11 +78,14 @@ def _get_worksheet():
     ]
     creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
     gc = gspread.authorize(creds)
-
     sheet_key = _require_env("GOOGLE_SHEET_KEY")
+    return gc.open_by_key(sheet_key)
+
+
+def _get_worksheet():
+    """Return an authenticated gspread Worksheet object for the sessions sheet."""
     worksheet_name = os.getenv("GOOGLE_WORKSHEET_NAME", "sessions")
-    spreadsheet = gc.open_by_key(sheet_key)
-    return spreadsheet.worksheet(worksheet_name)
+    return _open_spreadsheet().worksheet(worksheet_name)
 
 
 def _load_sheet_data() -> tuple:
@@ -202,6 +209,21 @@ def cli():
     """
 
 
+def _get_structured_content_version(event_id: str, headers: dict) -> int:
+    """Fetch the current structured-content version for *event_id* and return the next one.
+
+    If the request fails, falls back to version 2.
+    """
+    r = requests.get(
+        f"{EVENTS_URL}{event_id}/structured_content/edit/",
+        headers=headers,
+        timeout=30,
+    )
+    if r.status_code == 200:
+        return int(r.json().get("page_version_number", 1)) + 1
+    return 2  # safe fallback
+
+
 # ── list-events ────────────────────────────────────────────────────────────────
 
 
@@ -278,17 +300,7 @@ def list_events(status, page_size):
     default=False,
     help="Preview what would be created without making any API calls.",
 )
-@click.option(
-    "--content-version",
-    default=2,
-    show_default=True,
-    type=int,
-    help=(
-        "Structured-content version to use when setting descriptions. "
-        "Increment this if descriptions don't appear on Eventbrite."
-    ),
-)
-def create_events(dry_run, content_version):
+def create_events(dry_run):
     """Create Eventbrite events from Google Sheet rows that have no registration link.
 
     The tool copies a template event on Eventbrite (EVENTBRITE_TEMPLATE_ID),
@@ -302,7 +314,6 @@ def create_events(dry_run, content_version):
     Examples:
       python cli.py create-events --dry-run
       python cli.py create-events
-      python cli.py create-events --content-version 3
     """
     headers = _get_headers()
     template_id = _require_env("EVENTBRITE_TEMPLATE_ID")
@@ -332,7 +343,14 @@ def create_events(dry_run, content_version):
         )
 
     df_with_time = df[~df["start_time_UTC"].isna()]
-    df_to_create = df_with_time[df_with_time["registration_link"] == ""]
+    # Only create events for confirmed sessions
+    if "status" in df_with_time.columns:
+        df_to_create = df_with_time[
+            (df_with_time["registration_link"] == "")
+            & (df_with_time["status"] == "confirmed")
+        ]
+    else:
+        df_to_create = df_with_time[df_with_time["registration_link"] == ""]
 
     if df_to_create.empty:
         click.echo(
@@ -372,13 +390,7 @@ def create_events(dry_run, content_version):
             headers=headers,
             timeout=30,
             json={
-                "event.name.html": f"{row.title} [Resbaz]",
-                "event.description.html": description,
-                "event.start.utc": row.start_time_UTC.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "event.start.timezone": "Pacific/Auckland",
-                "event.end.utc": row.end_time_UTC.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "event.end.timezone": "Pacific/Auckland",
-                "event.capacity": int(row.capacity),
+                "event.name.html": f"{row.title} [ResBaz]",
             },
         )
         return r2
@@ -414,8 +426,9 @@ def create_events(dry_run, content_version):
             r, row = args
             desc = row.description if row.description else "Description to follow soon."
             ev_id = r.json()["id"]
+            version = _get_structured_content_version(ev_id, headers)
             return requests.post(
-                f"{EVENTS_URL}{ev_id}/structured_content/{content_version}/",
+                f"{EVENTS_URL}{ev_id}/structured_content/{version}/",
                 headers=headers,
                 timeout=30,
                 json={
@@ -438,18 +451,56 @@ def create_events(dry_run, content_version):
         if desc_errors:
             click.echo(
                 click.style(
-                    f"  Warning: {len(desc_errors)} description(s) failed. "
-                    "Try --content-version with a higher number.",
+                    f"  Warning: {len(desc_errors)} description(s) failed.",
                     fg="yellow",
                 )
             )
         else:
             click.echo(click.style("  ✓ Descriptions set.", fg="green"))
 
-    click.echo(
-        "\nNext step: run 'python cli.py update-sheet' to write Eventbrite URLs "
-        "back to the Google Sheet."
-    )
+    # Step 4: clear the legacy plain-text description (new notebooks do this)
+    if successes:
+        click.echo("\nClearing legacy unstructured description…")
+
+        def _clear_desc(args):
+            r, row = args
+            ev_id = r.json()["id"]
+            return requests.post(
+                f"{EVENTS_URL}{ev_id}/",
+                headers=headers,
+                timeout=30,
+                json={"event.description.html": ""},
+            )
+
+        clear_responses = list(thread_map(_clear_desc, successes, total=len(successes)))
+        clear_errors = [r for r in clear_responses if r.status_code not in (200, 201)]
+        if not clear_errors:
+            click.echo(click.style("  ✓ Legacy descriptions cleared.", fg="green"))
+        else:
+            click.echo(
+                click.style(
+                    f"  Warning: {len(clear_errors)} legacy description(s) could not be cleared.",
+                    fg="yellow",
+                )
+            )
+
+    # Step 5: write Eventbrite URLs back to Google Sheet (Column M)
+    if successes:
+        click.echo("\nWriting Eventbrite URLs to Google Sheet (Column M)…")
+        df_reload, worksheet = _load_sheet_data()
+        url_updates = []
+        for r_resp, row in successes:
+            eb_url = r_resp.json().get("url", "")
+            if not eb_url:
+                continue
+            # Find the row index in the sheet (1-based header + 1 offset)
+            matches = df_reload.index[df_reload["title"] == row.title].tolist()
+            if matches:
+                sheet_row = matches[0] + 2  # 1-based + header row
+                url_updates.append({"range": f"M{sheet_row}", "values": [[eb_url]]})
+        if url_updates:
+            worksheet.batch_update(url_updates)
+            click.echo(click.style(f"  ✓ Wrote {len(url_updates)} URL(s) to Column M.", fg="green"))
 
 
 # ── update-events ──────────────────────────────────────────────────────────────
@@ -463,19 +514,12 @@ def create_events(dry_run, content_version):
     help="Preview changes without making any API calls.",
 )
 @click.option(
-    "--content-version",
-    default=2,
-    show_default=True,
-    type=int,
-    help="Structured-content version to use for descriptions.",
-)
-@click.option(
     "--skip-descriptions",
     is_flag=True,
     default=False,
     help="Skip updating structured content (descriptions).",
 )
-def update_events(dry_run, content_version, skip_descriptions):
+def update_events(dry_run, skip_descriptions):
     """Sync Google Sheet data to existing Eventbrite events.
 
     Updates the title, description, start/end times, and capacity of every
@@ -485,7 +529,6 @@ def update_events(dry_run, content_version, skip_descriptions):
     Examples:
       python cli.py update-events --dry-run
       python cli.py update-events
-      python cli.py update-events --content-version 3
       python cli.py update-events --skip-descriptions
     """
     headers = _get_headers()
@@ -537,7 +580,7 @@ def update_events(dry_run, content_version, skip_descriptions):
             headers=headers,
             timeout=30,
             json={
-                "event.name.html": f"{row.title} [Resbaz]",
+                "event.name.html": f"{row.title} [ResBaz]",
                 "event.description.html": row.description,
                 "event.start.utc": row.start_time_UTC.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "event.start.timezone": "Pacific/Auckland",
@@ -574,8 +617,9 @@ def update_events(dry_run, content_version, skip_descriptions):
 
     def _set_desc(row):
         desc = row.description if row.description else "Description to follow soon."
+        version = _get_structured_content_version(row.eventbrite_id, headers)
         return requests.post(
-            f"{EVENTS_URL}{row.eventbrite_id}/structured_content/{content_version}/",
+            f"{EVENTS_URL}{row.eventbrite_id}/structured_content/{version}/",
             headers=headers,
             timeout=30,
             json={
@@ -606,11 +650,36 @@ def update_events(dry_run, content_version, skip_descriptions):
     if desc_errors:
         click.echo(
             click.style(
-                f"  Warning: {len(desc_errors)} description(s) failed. "
-                "Try --content-version with a higher number.",
+                f"  Warning: {len(desc_errors)} description(s) failed.",
                 fg="yellow",
             )
         )
+
+    # Clear legacy unstructured descriptions
+    if not skip_descriptions:
+        click.echo("\nClearing legacy unstructured description…")
+
+        def _clear_desc(row):
+            return requests.post(
+                f"{EVENTS_URL}{row.eventbrite_id}/",
+                headers=headers,
+                timeout=30,
+                json={"event.description.html": ""},
+            )
+
+        clear_responses = list(
+            thread_map(_clear_desc, df_happening.itertuples(), total=len(df_happening))
+        )
+        clear_errors = [r for r in clear_responses if r.status_code not in (200, 201)]
+        if not clear_errors:
+            click.echo(click.style("  ✓ Legacy descriptions cleared.", fg="green"))
+        else:
+            click.echo(
+                click.style(
+                    f"  Warning: {len(clear_errors)} legacy description(s) could not be cleared.",
+                    fg="yellow",
+                )
+            )
 
 
 # ── set-zoom ───────────────────────────────────────────────────────────────────
@@ -623,17 +692,7 @@ def update_events(dry_run, content_version, skip_descriptions):
     default=False,
     help="Preview without making changes.",
 )
-@click.option(
-    "--content-version",
-    default=1,
-    show_default=True,
-    type=int,
-    help=(
-        "Structured-content version for digital content. "
-        "Increment if Zoom links don't appear on the event page."
-    ),
-)
-def set_zoom(dry_run, content_version):
+def set_zoom(dry_run):
     """Add Zoom meeting links from Google Sheet to Eventbrite events.
 
     Reads the 'zoom_link' column from the Google Sheet and sets the online
@@ -643,7 +702,6 @@ def set_zoom(dry_run, content_version):
     Examples:
       python cli.py set-zoom --dry-run
       python cli.py set-zoom
-      python cli.py set-zoom --content-version 8
     """
     headers = _get_headers()
 
@@ -679,8 +737,9 @@ def set_zoom(dry_run, content_version):
     click.confirm(f"\nSet Zoom links for {len(df_zoom)} event(s)?", abort=True)
 
     def _set_zoom_link(row):
+        version = _get_structured_content_version(row.eventbrite_id, headers)
         r = requests.post(
-            f"{EVENTS_URL}{row.eventbrite_id}/structured_content/{content_version}/"
+            f"{EVENTS_URL}{row.eventbrite_id}/structured_content/{version}/"
             "?purpose=digital_content",
             headers=headers,
             timeout=30,
@@ -703,8 +762,7 @@ def set_zoom(dry_run, content_version):
         if r.status_code != 200:
             click.echo(
                 click.style(
-                    f"  ✗ Error for '{row.title}': HTTP {r.status_code}. "
-                    "Try --content-version with a higher number.",
+                    f"  ✗ Error for '{row.title}': HTTP {r.status_code}.",
                     fg="red",
                 )
             )
@@ -909,6 +967,40 @@ def delete_drafts(dry_run, page_size):
         )
 
     events = response.json().get("events", [])
+
+    # Apply safety filter using optional env vars
+    organizer_id_filter = os.getenv("EVENTBRITE_ORGANIZER_ID", "")
+    logo_id_filter = os.getenv("EVENTBRITE_LOGO_ID", "")
+    template_id_filter = os.getenv("EVENTBRITE_TEMPLATE_ID", "")
+
+    if organizer_id_filter or logo_id_filter:
+        original_count = len(events)
+        events = [
+            e for e in events
+            if (not organizer_id_filter or e.get("organizer_id") == organizer_id_filter)
+            and (not logo_id_filter or e.get("logo_id") == logo_id_filter)
+            and (not template_id_filter or e.get("id") != template_id_filter)
+        ]
+        if len(events) < original_count:
+            click.echo(
+                click.style(
+                    f"  (Filtered from {original_count} to {len(events)} events using "
+                    "EVENTBRITE_ORGANIZER_ID / EVENTBRITE_LOGO_ID safety filter)",
+                    fg="cyan",
+                )
+            )
+    elif os.getenv("EVENTBRITE_TEMPLATE_ID"):
+        template_id_filter = os.getenv("EVENTBRITE_TEMPLATE_ID")
+        original_count = len(events)
+        events = [e for e in events if e.get("id") != template_id_filter]
+        if len(events) < original_count:
+            click.echo(
+                click.style(
+                    f"  (Excluded template event {template_id_filter})",
+                    fg="cyan",
+                )
+            )
+
     if not events:
         click.echo("No draft events found.")
         return
@@ -985,10 +1077,10 @@ def update_sheet(dry_run):
     This command updates the following columns when the schedule provides
     new or changed values:
       • Column J  — Duration in hours
-      • Column R  — Start time (UTC)
-      • Column S  — End time (UTC)
-      • Column T  — Start time (Auckland)
-      • Column U  — End time (Auckland)
+      • Column P  — Start time (UTC)
+      • Column Q  — End time (UTC)
+      • Column R  — Start time (Auckland)
+      • Column S  — End time (Auckland)
 
     Note: registration URLs (Column N) are managed directly by Eventbrite
     and are not written by this command.
@@ -1050,7 +1142,7 @@ def update_sheet(dry_run):
         row_idx = i + 2  # account for header row
         updates.append(
             {
-                "range": f"R{row_idx}:U{row_idx}",
+                "range": f"P{row_idx}:S{row_idx}",
                 "values": [
                     [
                         row["start_time_UTC"].strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1354,8 +1446,8 @@ def check(show_diff):
         eb_status = event.get("status", "unknown")
         sheet_name = row.title
 
-        # Strip the [Resbaz] suffix added on create/update before comparing
-        eb_name_normalised = eb_name.removesuffix(" [Resbaz]")
+        # Strip the [ResBaz] suffix added on create/update before comparing
+        eb_name_normalised = eb_name.removesuffix(" [ResBaz]")
 
         diffs = []
         if eb_name_normalised.lower().strip() != sheet_name.lower().strip():
@@ -1387,6 +1479,207 @@ def check(show_diff):
                 click.echo(f"    sheet      : {sheet_val!r}")
                 click.echo(f"    eventbrite : {eb_val!r}")
                 click.echo(f"    diff       : {_diff_strings(sheet_val, eb_val)}")
+
+
+# ── generate-yaml ─────────────────────────────────────────────────────────────
+
+
+@cli.command("generate-yaml")
+@click.option(
+    "--output-dir",
+    default=".",
+    show_default=True,
+    help="Directory to write the YAML files into.",
+)
+def generate_yaml(output_dir):
+    """Generate schedule.yml, sessions.yml, and speakers.yml for the ResBaz website.
+
+    Reads the 'sessions', 'schedule', and 'speakers' worksheets from the Google
+    Sheet and produces three YAML files suitable for the ResBaz Jekyll website.
+
+    \b
+    Examples:
+      python cli.py generate-yaml
+      python cli.py generate-yaml --output-dir _data/
+    """
+    click.echo("Connecting to Google Sheet…")
+    spreadsheet = _open_spreadsheet()
+
+    def _ws_to_df(name):
+        ws = spreadsheet.worksheet(name)
+        rows = ws.get_all_values()
+        return pd.DataFrame(rows[1:], columns=rows[0])
+
+    sessions_df = _ws_to_df("sessions")
+    schedule_df = _ws_to_df("schedule")
+    speakers_df = _ws_to_df("speakers")
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # ── Custom YAML dumper ────────────────────────────────────────────────────
+    class _CustomDumper(yaml.SafeDumper):
+        def increase_indent(self, flow=False, indentless=False):
+            return super().increase_indent(flow, False)
+
+        def represent_data(self, data):
+            if isinstance(data, str) and data == "09:00":
+                return self.represent_scalar("tag:yaml.org,2002:str", data, style="'")
+            return super().represent_data(data)
+
+    def _dict_representer(dumper, data):
+        return dumper.represent_dict(data.items())
+
+    def _int_representer(dumper, data):
+        return dumper.represent_scalar("tag:yaml.org,2002:int", f"{data:03}")
+
+    _CustomDumper.add_representer(dict, _dict_representer)
+    _CustomDumper.add_representer(int, _int_representer)
+
+    def _custom_dump(data):
+        return yaml.dump(data, Dumper=_CustomDumper, default_flow_style=None)
+
+    # ── schedule.yml ──────────────────────────────────────────────────────────
+    click.echo("Generating schedule.yml…")
+    day_list = []
+    for date, data in schedule_df.groupby("date"):
+        day_dict = {
+            "date": date,
+            "dateReadable": data["dateReadable"].iloc[0],
+            "tracks": [{"title": "1", "color": "#f27f27"}],
+        }
+        if data.get("track2", pd.Series()).str.isnumeric().any():
+            day_dict["tracks"].append({"title": "2", "color": "#e91e63"})
+        if data.get("track3", pd.Series()).str.isnumeric().any():
+            day_dict["tracks"].append({"title": "3", "color": "#3279a8"})
+        day_dict["timeslots"] = []
+        for _, row in data.iterrows():
+            session_ids = [
+                int(sid)
+                for sid in [row.get("track1", ""), row.get("track2", ""), row.get("track3", "")]
+                if sid
+            ]
+            if session_ids:
+                day_dict["timeslots"].append(
+                    {
+                        "startTime": str(row["startTime"]),
+                        "endTime": str(row["endTime"]),
+                        "sessionIds": session_ids,
+                    }
+                )
+        day_list.append(day_dict)
+
+    schedule_path = out / "schedule.yml"
+    schedule_path.write_text(_custom_dump(day_list), encoding="utf-8")
+    click.echo(click.style(f"  ✓ {schedule_path}", fg="green"))
+
+    # ── sessions.yml ──────────────────────────────────────────────────────────
+    click.echo("Generating sessions.yml…")
+
+    # Determine which session IDs are scheduled
+    scheduled_ids = set()
+    for col in ["track1", "track2", "track3"]:
+        if col in schedule_df.columns:
+            scheduled_ids |= set(schedule_df[col].dropna().replace("", pd.NA).dropna().tolist())
+    sessions_running = sessions_df[sessions_df["id"].isin(scheduled_ids)]
+
+    # Build speaker lookup: full name → id
+    speakers_df["_fullname"] = (
+        speakers_df["name"].str.strip() + " " + speakers_df["surname"].str.strip()
+    )
+    speaker_lookup = dict(
+        zip(speakers_df["_fullname"], speakers_df["id"].apply(lambda x: int(x) if x else None))
+    )
+    skip_speakers = set(
+        speakers_df.loc[speakers_df["skip"] == "yes", "_fullname"].tolist()
+    )
+
+    def _get_speaker_ids(names_str):
+        names = [n.strip() for n in re.split(r"[,;]", names_str) if n.strip()]
+        result = []
+        for name in names:
+            if name in speaker_lookup and name not in skip_speakers:
+                result.append(speaker_lookup[name])
+        return result if result else []
+
+    sessions_dict = [
+        {"id": 200, "title": "Break", "description": "", "speakers": [], "hidden": True},
+        {"id": 201, "title": "Lunch", "description": "", "speakers": [], "hidden": True},
+        {"id": 300, "title": "To Be Announced", "description": "", "speakers": [], "hidden": True},
+    ]
+    for row in sessions_running.itertuples():
+        status = getattr(row, "status", "")
+        if status not in ("confirmed", "EB-exclude"):
+            continue
+        themes_raw = getattr(row, "themes", "")
+        themes = [t.strip().replace("'", "") for t in themes_raw.split(",") if t.strip()]
+        length_h = getattr(row, "length", "") or getattr(row, "duration_hours", "1")
+        try:
+            length_h = int(float(str(length_h)))
+        except (ValueError, TypeError):
+            length_h = 1
+        length_str = "1 hour" if length_h == 1 else f"{length_h} hours"
+        instructors_raw = getattr(row, "instructors", "")
+        sessions_dict.append(
+            {
+                "id": int(row.id),
+                "title": row.title,
+                "description": row.description,
+                "subtype": "workshop",
+                "speakers": _get_speaker_ids(instructors_raw),
+                "complexity": getattr(row, "complexity", ""),
+                "length": length_str,
+                "capacity": getattr(row, "capacity", ""),
+                "themes": themes,
+                "registration_link": getattr(row, "registration_link", ""),
+            }
+        )
+
+    sessions_path = out / "sessions.yml"
+    sessions_path.write_text(_custom_dump(sessions_dict), encoding="utf-8")
+    click.echo(click.style(f"  ✓ {sessions_path}", fg="green"))
+
+    # ── speakers.yml ─────────────────────────────────────────────────────────
+    click.echo("Generating speakers.yml…")
+    speakers_list = []
+    for row in speakers_df.itertuples():
+        if getattr(row, "skip", "") == "yes":
+            continue
+        speakers_list.append(
+            {
+                "id": int(row.id),
+                "name": row.name.strip(),
+                "surname": row.surname.strip(),
+                "company": getattr(row, "company", ""),
+                "title": getattr(row, "title", ""),
+                "bio": getattr(row, "bio", ""),
+                "thumbnailUrl": getattr(row, "thumbnailUrl", ""),
+                "rockstar": False,
+                "ribbon": [
+                    {
+                        "abbr": getattr(row, "ribbon_abbr", ""),
+                        "title": getattr(row, "ribbon_title", ""),
+                        "url": getattr(row, "ribbon_url", ""),
+                    }
+                ],
+                "social": [
+                    {
+                        "name": getattr(row, "social_name", ""),
+                        "link": getattr(row, "social_link", ""),
+                    }
+                ],
+            }
+        )
+
+    speakers_path = out / "speakers.yml"
+    speakers_path.write_text(_custom_dump(speakers_list), encoding="utf-8")
+    click.echo(click.style(f"  ✓ {speakers_path}", fg="green"))
+
+    click.echo(
+        click.style(
+            f"\n✓ Generated 3 YAML files in '{output_dir}'.", fg="green"
+        )
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
