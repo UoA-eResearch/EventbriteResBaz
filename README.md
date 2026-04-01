@@ -78,8 +78,9 @@ python cli.py create-events
 python cli.py create-events --content-version 3
 ```
 
-After creating events, run `update-sheet` to write the new Eventbrite URLs
-back to the Google Sheet.
+After creating events, run `update-sheet` to sync schedule times and durations
+back to the Google Sheet (registration URLs are already in the sheet after
+Eventbrite creates the events).
 
 ### `update-events`
 
@@ -137,9 +138,10 @@ python cli.py delete-drafts
 
 ### `update-sheet`
 
-Write schedule times (start/end UTC and Auckland, duration) back to the
-Google Sheet.  The registration URL column (N) should be updated manually or
-by Eventbrite after creation.
+Sync schedule times and durations from the ResBaz schedule back to the Google
+Sheet.  This updates columns J (duration), R–U (start/end times in UTC and
+Auckland timezone).  Registration URLs (column N) are not modified by this
+command; they are populated by Eventbrite when events are created.
 
 ```bash
 python cli.py update-sheet --dry-run
@@ -191,7 +193,7 @@ python cli.py create-events --dry-run
 # 3. Create events
 python cli.py create-events
 
-# 4. Write URLs back to the Google Sheet
+# 4. Sync schedule times back to the Google Sheet
 python cli.py update-sheet
 
 # 5. Set Zoom links

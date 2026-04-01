@@ -10,7 +10,6 @@ Configuration is loaded from a .env file (see .env.example).
 
 import difflib
 import os
-import sys
 from io import StringIO
 from pathlib import Path
 
@@ -152,19 +151,20 @@ def _enrich_df_with_schedule(df: pd.DataFrame, session_lookup: dict) -> pd.DataF
     )
     df["duration"] = df["end_time_Auckland"] - df["start_time_Auckland"]
     df["duration_hours"] = (
-        df["duration"].round("h").dt.components["hours"].astype("Int64")
+        df["duration"].dt.round("h").dt.components["hours"].astype("Int64")
     )
     df["start_time_UTC"] = df["start_time_Auckland"].dt.tz_convert("UTC")
     df["end_time_UTC"] = df["end_time_Auckland"].dt.tz_convert("UTC")
 
-    # Normalise capacity: "open" or empty → 1000
-    df["capacity"] = (
-        df["capacity"]
-        .replace({"open": "1000", "": "1000"})
-        .pipe(pd.to_numeric, errors="coerce")
-        .fillna(1000)
-        .astype(int)
-    )
+    # Normalise capacity: "open" or empty → 1000; column may be absent on partial DFs
+    if "capacity" in df.columns:
+        df["capacity"] = (
+            df["capacity"]
+            .replace({"open": "1000", "": "1000"})
+            .pipe(pd.to_numeric, errors="coerce")
+            .fillna(1000)
+            .astype(int)
+        )
     return df
 
 
@@ -323,7 +323,15 @@ def create_events(dry_run, content_version):
             )
         )
 
-    df_with_time = df[~df.get("start_time_UTC", pd.Series(dtype=object)).isna()]
+    if "start_time_UTC" not in df.columns:
+        raise click.ClickException(
+            "Could not determine event start times. The schedule could not be "
+            "loaded and the sheet does not contain a 'start_time_UTC' column. "
+            "Please either fix the schedule source or add a 'start_time_UTC' "
+            "column with UTC start times to the sheet."
+        )
+
+    df_with_time = df[~df["start_time_UTC"].isna()]
     df_to_create = df_with_time[df_with_time["registration_link"] == ""]
 
     if df_to_create.empty:
@@ -493,13 +501,20 @@ def update_events(dry_run, content_version, skip_descriptions):
         click.echo(click.style(f"Warning: could not load schedule ({exc}).", fg="yellow"))
 
     df_happening = df[df["registration_link"] != ""].copy()
+
+    if "start_time_UTC" not in df_happening.columns:
+        raise click.ClickException(
+            "Expected 'start_time_UTC' column in data but it was missing. "
+            "Ensure the schedule download and enrichment completed successfully."
+        )
+
     df_happening["eventbrite_id"] = (
         df_happening["registration_link"].str.split("-").str[-1]
     )
     df_happening = df_happening[
         df_happening["eventbrite_id"].notna()
         & (df_happening["eventbrite_id"] != "")
-        & ~df_happening.get("start_time_UTC", pd.Series(dtype=object)).isna()
+        & df_happening["start_time_UTC"].notna()
     ]
 
     if df_happening.empty:
@@ -965,23 +980,24 @@ def delete_drafts(dry_run, page_size):
     help="Preview changes without writing to the sheet.",
 )
 def update_sheet(dry_run):
-    """Write Eventbrite URLs and schedule times back to the Google Sheet.
+    """Sync schedule times and durations from the ResBaz schedule back to the Google Sheet.
 
-    After events are created, this command fills in:
-      • Column N  — Eventbrite registration URL
+    This command updates the following columns when the schedule provides
+    new or changed values:
       • Column J  — Duration in hours
       • Column R  — Start time (UTC)
       • Column S  — End time (UTC)
       • Column T  — Start time (Auckland)
       • Column U  — End time (Auckland)
 
+    Note: registration URLs (Column N) are managed directly by Eventbrite
+    and are not written by this command.
+
     \b
     Examples:
       python cli.py update-sheet --dry-run
       python cli.py update-sheet
     """
-    from tqdm.auto import tqdm as _tqdm
-
     click.echo("Loading Google Sheet data…")
     df, worksheet = _load_sheet_data()
     orig_df = df.copy()
@@ -993,21 +1009,24 @@ def update_sheet(dry_run):
     except Exception as exc:
         click.echo(click.style(f"Warning: could not load schedule ({exc}).", fg="yellow"))
 
-    # Rows where the schedule produced new/different times
-    needs_time_update = df[
-        ~df.get("start_time_UTC", pd.Series(dtype=object)).isna()
-        & (
-            df.get("start_time_UTC", pd.Series(dtype=object)).astype(str)
-            != orig_df.get("start_time_UTC", pd.Series(dtype=str)).astype(str)
+    required_time_col = "start_time_UTC"
+    if required_time_col not in df.columns or required_time_col not in orig_df.columns:
+        raise click.ClickException(
+            f"Time column '{required_time_col}' is not available; "
+            "cannot compute time updates. Ensure the sheet and schedule data "
+            "provide this column."
         )
-    ]
 
-    # Rows that now have an Eventbrite URL (registration_link populated after create-events)
-    df_with_eb = df[df["registration_link"] != ""].copy()
+    # Rows where the schedule produced new/different times
+    current_times = df[required_time_col]
+    original_times = orig_df[required_time_col]
+    needs_time_update = df[
+        current_times.notna()
+        & (current_times.astype(str) != original_times.astype(str))
+    ]
 
     time_rows = list(needs_time_update.iterrows())
     click.echo(f"\nTime updates pending  : {len(time_rows)} row(s)")
-    click.echo(f"Eventbrite URL rows   : {len(df_with_eb)} row(s) (already in sheet)")
 
     if not time_rows:
         click.echo("Nothing to update.")
@@ -1017,7 +1036,7 @@ def update_sheet(dry_run):
     for i, row in time_rows:
         click.echo(
             f"  Row {i + 2:>4}: {row.get('title', '')}  "
-            f"→  {row['start_time_UTC'].strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            f"→  {row[required_time_col].strftime('%Y-%m-%dT%H:%M:%SZ')}"
         )
 
     if dry_run:
@@ -1026,17 +1045,32 @@ def update_sheet(dry_run):
 
     click.confirm(f"\nWrite {len(time_rows)} row(s) to the Google Sheet?", abort=True)
 
-    for i, row in _tqdm(time_rows, desc="Updating sheet"):
-        worksheet.update(f"R{i + 2}", row["start_time_UTC"].strftime("%Y-%m-%dT%H:%M:%SZ"))
-        worksheet.update(f"S{i + 2}", row["end_time_UTC"].strftime("%Y-%m-%dT%H:%M:%SZ"))
-        worksheet.update(
-            f"T{i + 2}", row["start_time_Auckland"].strftime("%Y-%m-%dT%H:%M:%S")
-        )
-        worksheet.update(
-            f"U{i + 2}", row["end_time_Auckland"].strftime("%Y-%m-%dT%H:%M:%S")
+    updates = []
+    for i, row in time_rows:
+        row_idx = i + 2  # account for header row
+        updates.append(
+            {
+                "range": f"R{row_idx}:U{row_idx}",
+                "values": [
+                    [
+                        row["start_time_UTC"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        row["end_time_UTC"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        row["start_time_Auckland"].strftime("%Y-%m-%dT%H:%M:%S"),
+                        row["end_time_Auckland"].strftime("%Y-%m-%dT%H:%M:%S"),
+                    ]
+                ],
+            }
         )
         if pd.notna(row.get("duration_hours")):
-            worksheet.update(f"J{i + 2}", int(row["duration_hours"]))
+            updates.append(
+                {
+                    "range": f"J{row_idx}",
+                    "values": [[int(row["duration_hours"])]],
+                }
+            )
+
+    if updates:
+        worksheet.batch_update(updates)
 
     click.echo(click.style("\n✓ Google Sheet updated.", fg="green"))
 
@@ -1078,10 +1112,17 @@ def update_ticket_classes(dry_run):
     df_happening["eventbrite_id"] = (
         df_happening["registration_link"].str.split("-").str[-1]
     )
+
+    if "start_time_UTC" not in df_happening.columns:
+        raise click.ClickException(
+            "Expected 'start_time_UTC' column in data but it was missing. "
+            "Ensure the schedule download and enrichment completed successfully."
+        )
+
     df_happening = df_happening[
         df_happening["eventbrite_id"].notna()
         & (df_happening["eventbrite_id"] != "")
-        & ~df_happening.get("start_time_UTC", pd.Series(dtype=object)).isna()
+        & df_happening["start_time_UTC"].notna()
     ]
 
     if df_happening.empty:
@@ -1192,9 +1233,20 @@ def get_attendees(output, full):
                 params={"continuation": continuation},
                 headers=headers,
                 timeout=60,
-            ).json()
-            continuation = resp.get("pagination", {}).get("continuation")
-            attendees.extend(resp.get("attendees", []))
+            )
+            if resp.status_code != 200:
+                raise click.ClickException(
+                    f"Failed to fetch attendees for event {event_id}: "
+                    f"HTTP {resp.status_code} {resp.text}"
+                )
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise click.ClickException(
+                    f"Invalid JSON response from Eventbrite for event {event_id}: {exc}"
+                )
+            continuation = data.get("pagination", {}).get("continuation")
+            attendees.extend(data.get("attendees", []))
         if not attendees:
             return pd.DataFrame()
         attendee_df = pd.json_normalize(attendees)
@@ -1255,8 +1307,9 @@ def get_attendees(output, full):
 def check(show_diff):
     """Check Google Sheet data against live Eventbrite events and report differences.
 
-    Fetches each event from Eventbrite and compares its title (and status)
-    against what is recorded in the Google Sheet.
+    Fetches each event from Eventbrite and compares its title against what is
+    recorded in the Google Sheet.  The Eventbrite event status is displayed
+    alongside any mismatches but is not itself compared.
 
     \b
     Examples:
